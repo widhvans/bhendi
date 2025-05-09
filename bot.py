@@ -62,10 +62,12 @@ class TelegramBot:
                             
                             # Update progress every 10 seconds or every 100 files
                             if processed % 100 == 0:
-                                await status     
                                 await status_message.edit_text(f"Indexing... [{processed} files indexed]")
                                 await asyncio.sleep(10)
-                                
+                
+                # Add delay to prevent overwhelming Telegram API
+                await asyncio.sleep(1)
+                
                 if len(updates) < 100:  # If we got less than 100 updates, we're likely done
                     break
                     
@@ -135,7 +137,10 @@ class TelegramBot:
                 )
     
     def run(self):
-        app = Application.builder().token(config.BOT_TOKEN).build()
+        app = Application.builder().token(config.BOT_TOKEN).build(
+            connection_pool_size=20,  # Increase pool size
+            pool_timeout=30  # Increase timeout
+        )
         
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("index", self.index))
