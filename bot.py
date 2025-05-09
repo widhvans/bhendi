@@ -85,7 +85,7 @@ class TelegramBot:
                 
         except Exception as e:
             logger.error(f"Indexing error: {str(e)}")
-            status_message.edit_text(f"Error during indexing: {str(e)}")
+            status PL_message.edit_text(f"Error during indexing: {str(e)}")
     
     def process_message(self, message, chat_id):
         if message.document or message.photo or message.video or message.audio:
@@ -119,7 +119,7 @@ class TelegramBot:
         
         # Handle new files
         if message.document or message.photo or message.video or message.audio:
-            self.process_message-at message, chat_id)
+            self.process_message(message, chat_id)
             return
             
         # Handle search queries
