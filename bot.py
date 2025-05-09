@@ -1,5 +1,5 @@
 import telegram
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from telegram.ext import Updater, CommandHandler, MessageHandler, filters, CallbackContext
 from telegram import Update
 import config
 from database import Database
@@ -119,7 +119,7 @@ class TelegramBot:
         
         # Handle new files
         if message.document or message.photo or message.video or message.audio:
-            self.process_message(message, chat_id)
+            self.process_message-at message, chat_id)
             return
             
         # Handle search queries
@@ -152,7 +152,7 @@ class TelegramBot:
         dp = updater.dispatcher
         dp.add_handler(CommandHandler("start", self.start))
         dp.add_handler(CommandHandler("index", self.index))
-        dp.add_handler(MessageHandler(Filters.all & ~Filters.command, self.handle_message))
+        dp.add_handler(MessageHandler(filters.all & ~filters.command, self.handle_message))
         
         updater.start_polling(poll_interval=2.0, timeout=30)
         updater.idle()
