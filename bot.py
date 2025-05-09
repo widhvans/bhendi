@@ -8,10 +8,17 @@ import logging
 import asyncio
 import httpx
 
-# Configure logging to show only necessary logs
+# Configure logging to output to console and file
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # Console output
+        logging.FileHandler('bot.log')  # File output
+    ]
+)
 logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('telegram').setLevel(logging.WARNING)
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class TelegramBot:
@@ -20,7 +27,9 @@ class TelegramBot:
         self.semaphore = asyncio.Semaphore(5)  # Limit to 5 concurrent API calls
         
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info("Received /start command")
         if update.effective_chat.type not in ['group', 'supergroup']:
+            logger.info("Ignoring /start in non-group chat")
             return
         chat_id = update.effective_chat.id
         async with self.semaphore:
@@ -29,6 +38,7 @@ class TelegramBot:
         is_admin = any(admin.user.id == bot_id for admin in admins)
         
         if is_admin:
+            logger.info(f"Bot is admin in chat {chat_id}, sending welcome message")
             async with self.semaphore:
                 await context.bot.send_message(
                     chat_id=chat_id,
@@ -36,7 +46,9 @@ class TelegramBot:
                 )
     
     async def index(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info("Received /index command")
         if update.effective_chat.type not in ['group', 'supergroup']:
+            logger.info("Ignoring /index in non-group chat")
             return
             
         chat_id = update.effective_chat.id
@@ -45,6 +57,7 @@ class TelegramBot:
             admins = await context.bot.get_chat_administrators(chat_id)
         
         if not any(admin.user.id == user_id for admin in admins):
+            logger.info(f"Non-admin user {user_id} tried /index in chat {chat_id}")
             async with self.semaphore:
                 await context.bot.send_message(
                     chat_id=chat_id,
@@ -52,6 +65,7 @@ class TelegramBot:
                 )
             return
             
+        logger.info(f"Starting indexing for chat {chat_id}")
         async with self.semaphore:
             status_message = await context.bot.send_message(
                 chat_id=chat_id,
@@ -62,9 +76,11 @@ class TelegramBot:
         try:
             offset = 0
             while True:
+                logger.info(f"Fetching updates with offset {offset}")
                 async with self.semaphore:
                     updates = await context.bot.get_updates(offset=offset, timeout=30)
                 if not updates:
+                    logger.info("No more updates to process")
                     break
                     
                 batch_processed = 0
@@ -76,15 +92,19 @@ class TelegramBot:
                             processed += 1
                             
                             if processed % 100 == 0:
+                                logger.info(f"Processed {processed} files, updating status")
                                 async with self.semaphore:
                                     await status_message.edit_text(f"Indexing... [{processed} files indexed]")
                                 await asyncio.sleep(10)  # Update every 10 seconds or 100 files
                 
                 if batch_processed == 0 and len(updates) < 100:
+                    logger.info("No new files processed and fewer than 100 updates, stopping")
                     break
                     
+                logger.info("Pausing 2 seconds before next batch")
                 await asyncio.sleep(2)  # Rate limit between batches
                 
+            logger.info(f"Indexing complete for chat {chat_id}, {processed} files indexed")
             async with self.semaphore:
                 await status_message.edit_text(f"Indexing complete! {processed} files indexed.")
             
@@ -122,12 +142,15 @@ class TelegramBot:
                 file_id = message.audio.file_id
                 
             if file_name and file_id:
+                logger.info(f"Saving file: {file_name} with ID {file_id} for chat {chat_id}")
                 self.db.save_file(chat_id, file_name, file_id)
                 return True
         return False
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info("Handling new message")
         if update.effective_chat.type not in ['group', 'supergroup']:
+            logger.info("Ignoring message in non-group chat")
             return
             
         chat_id = update.effective_chat.id
@@ -135,15 +158,18 @@ class TelegramBot:
         
         # Handle new files
         if message.document or message.photo or message.video or message.audio:
+            logger.info(f"Processing new media file in chat {chat_id}")
             await self.process_message(message, chat_id)
             return
             
         # Handle search queries
         if message.text:
             search_term = message.text.lower()
+            logger.info(f"Searching for term '{search_term}' in chat {chat_id}")
             files = self.db.search_files(chat_id, search_term)
             
             if files:
+                logger.info(f"Found {len(files)} files matching '{search_term}'")
                 for file in files:
                     async with self.semaphore:
                         await context.bot.send_document(
@@ -152,6 +178,7 @@ class TelegramBot:
                             caption=f"Found: {file['file_name']}"
                         )
             else:
+                logger.info(f"No files found for '{search_term}', notifying admins")
                 async with self.semaphore:
                     admins = await context.bot.get_chat_administrators(chat_id)
                 for admin in admins:
@@ -168,12 +195,14 @@ class TelegramBot:
                     )
     
     def run(self):
+        logger.info("Starting bot")
         app = Application.builder().token(config.BOT_TOKEN).build()
         
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("index", self.index))
         app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_message))
         
+        logger.info("Running polling")
         app.run_polling(poll_interval=2.0, timeout=30)
 
 if __name__ == '__main__':
