@@ -6,6 +6,7 @@ from database import Database
 import logging
 import asyncio
 import httpx
+from queue import Queue
 
 # Configure logging to show only necessary logs
 logging.getLogger('httpx').setLevel(logging.WARNING)
@@ -147,7 +148,8 @@ class TelegramBot:
                 )
     
     def run(self):
-        updater = Updater(config.BOT_TOKEN)
+        update_queue = Queue()
+        updater = Updater(config.BOT_TOKEN, update_queue)
         
         dp = updater.dispatcher
         dp.add_handler(CommandHandler("start", self.start))
