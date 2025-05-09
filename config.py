@@ -1,2 +1,2 @@
-BOT_TOKEN = "your_bot_token_here"
-MONGO_URI = "your_mongodb_uri_here"
+BOT_TOKEN = "5792496493:AAEdISosRZptqrYa-yNbO8R9zrat-L5TiIQ"
+MONGO_URI = "mongodb+srv://soniji:chaloji@cluster0.i5zy74f.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
