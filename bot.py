@@ -1,6 +1,6 @@
 import telegram
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram import Update
+from telegram import Update, MessageOrigin
 from telegram.error import BadRequest, TelegramError
 import config
 from database import Database
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 class TelegramBot:
     def __init__(self):
         self.db = Database()
-        self.semaphore = asyncio.Semaphore(2)  # Reduced to 2 to prevent pool timeout
+        self.semaphore = asyncio.Semaphore(1)  # Strict rate limiting to prevent pool timeout
         
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info("Received /start command")
@@ -43,7 +43,7 @@ class TelegramBot:
             async with self.semaphore:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text="I'm now an admin! 🎉\nAvailable commands:\n/index - Index media/documents\n/reindex - Reindex after sending old files\n/status - Check indexing progress"
+                    text="I'm now an admin! 🎉\nAvailable commands:\n/index - Index media/documents\n/reindex - Reindex after sending old files\n/forward - Forward specific messages\n/status - Check indexing progress"
                 )
     
     async def index(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -75,6 +75,15 @@ class TelegramBot:
         processed = 0
         
         try:
+            # Check pinned message for media
+            async with self.semaphore:
+                chat = await context.bot.get_chat(chat_id)
+                if chat.pinned_message:
+                    logger.info(f"Processing pinned message in chat {chat_id}")
+                    if await self.process_message(chat.pinned_message, chat_id):
+                        processed += 1
+                        logger.info("Indexed file from pinned message")
+            
             # Post a dummy file as reference
             dummy_file = io.BytesIO(b"Dummy file for indexing")
             dummy_file.name = "index_reference.txt"
@@ -88,11 +97,12 @@ class TelegramBot:
             logger.info(f"Posted reference file with message_id {reference_message_id}")
             
             # Fetch messages backward from reference_message_id
-            current_message_id = reference_message_id
+            last_processed_id = self.db.get_last_indexed_message_id(chat_id) or reference_message_id
+            current_message_id = min(reference_message_id, last_processed_id)
             while current_message_id > 1:
                 logger.info(f"Fetching messages for chat {chat_id}, up to message_id: {current_message_id}")
                 messages = []
-                for i in range(100):
+                for i in range(50):  # Smaller batch to reduce API load
                     target_id = current_message_id - i
                     if target_id < 1:
                         break
@@ -130,13 +140,14 @@ class TelegramBot:
                                 await status_message.edit_text(f"Indexing... [{processed} files indexed]")
                             await asyncio.sleep(10)  # Update every 10 seconds or 100 files
                 
-                if batch_processed == 0 or len(messages) < 100:
-                    logger.info("No new files processed or fewer than 100 messages, stopping")
+                if batch_processed == 0 or len(messages) < 50:
+                    logger.info("No new files processed or fewer than 50 messages, stopping")
                     break
                     
                 current_message_id = min(m['message_id'] for m in messages)
-                logger.info(f"Pausing 4 seconds before next batch, next message_id: {current_message_id}")
-                await asyncio.sleep(4)  # Increased to 4 seconds to prevent pool timeout
+                self.db.save_indexed_message_id(chat_id, current_message_id)
+                logger.info(f"Pausing 5 seconds before next batch, next message_id: {current_message_id}")
+                await asyncio.sleep(5)  # Increased to 5 seconds to prevent pool timeout
             
             # Delete reference file
             try:
@@ -152,7 +163,7 @@ class TelegramBot:
                 admin_mentions = ' '.join([f"@{admin.user.username}" for admin in admins if admin.user.username])
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"{admin_mentions}, please send or forward a media file to index older files, then use /reindex."
+                    text=f"{admin_mentions}, please send or forward a media file to index older files, then use /reindex or /forward <message_id>."
                 )
             
         except BadRequest as e:
@@ -167,7 +178,7 @@ class TelegramBot:
             async with self.semaphore:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"Telegram API error during indexing: {str(e)}. Please send or forward a media file and use /reindex."
+                    text=f"Telegram API error during indexing: {str(e)}. Please send or forward a media file and use /reindex or /forward <message_id>."
                 )
         except Exception as e:
             logger.error(f"Unexpected error during indexing: {str(e)}")
@@ -180,6 +191,93 @@ class TelegramBot:
     async def reindex(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info("Received /reindex command")
         await self.index(update, context)
+    
+    async def forward(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info("Received /forward command")
+        if update.effective_chat.type not in ['group', 'supergroup']:
+            logger.info("Ignoring /forward in non-group chat")
+            return
+            
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        async with self.semaphore:
+            admins = await context.bot.get_chat_administrators(chat_id)
+        
+        if not any(admin.user.id == user_id for admin in admins):
+            logger.info(f"Non-admin user {user_id} tried /forward in chat {chat_id}")
+            async with self.semaphore:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="Only admins can use /forward command!"
+                )
+            return
+            
+        if not context.args:
+            logger.info("No message ID provided for /forward")
+            async with self.semaphore:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="Please provide a message ID or link to forward, e.g., /forward 123 or /forward https://t.me/c/.../123"
+                )
+            return
+            
+        message_id = None
+        try:
+            arg = context.args[0]
+            if arg.startswith('https://t.me/'):
+                # Extract message ID from link
+                message_id = int(arg.split('/')[-1])
+            else:
+                message_id = int(arg)
+        except ValueError:
+            logger.info(f"Invalid message ID format: {context.args[0]}")
+            async with self.semaphore:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="Invalid message ID or link format. Use /forward <message_id> or /forward <message_link>"
+                )
+            return
+            
+        logger.info(f"Attempting to index message {message_id} in chat {chat_id}")
+        try:
+            async with self.semaphore:
+                response = await context.bot._post(
+                    'getMessage',
+                    data={
+                        'chat_id': chat_id,
+                        'message_id': message_id
+                    }
+                )
+            if response.get('ok'):
+                message_obj = telegram.Message.de_json(response['result'], context.bot)
+                if message_obj and await self.process_message(message_obj, chat_id):
+                    logger.info(f"Indexed file from forwarded message {message_id}")
+                    async with self.semaphore:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"Indexed file from message {message_id}. Use /reindex to continue or /forward another message ID."
+                        )
+                else:
+                    logger.info(f"No media found in message {message_id}")
+                    async with self.semaphore:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"No media found in message {message_id}. Try another message ID or forward the message manually."
+                        )
+            else:
+                logger.warning(f"Failed to fetch message {message_id}: {response.get('description', 'Unknown error')}")
+                async with self.semaphore:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"Could not access message {message_id}. Please forward the message manually or try another ID."
+                    )
+        except TelegramError as e:
+            logger.error(f"Telegram API error fetching message {message_id}: {str(e)}")
+            async with self.semaphore:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Error fetching message {message_id}: {str(e)}. Please forward the message manually."
+                )
     
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info("Received /status command")
@@ -202,12 +300,12 @@ class TelegramBot:
             return
             
         file_count = self.db.get_file_count(chat_id)
-        last_offset = self.db.get_last_indexed_offset(chat_id) or 0
-        logger.info(f"Status for chat {chat_id}: {file_count} files indexed, last offset {last_offset}")
+        last_message_id = self.db.get_last_indexed_message_id(chat_id) or 0
+        logger.info(f"Status for chat {chat_id}: {file_count} files indexed, last message_id {last_message_id}")
         async with self.semaphore:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"Indexing Status:\n- Files indexed: {file_count}\n- Last processed update offset: {last_offset}"
+                text=f"Indexing Status:\n- Files indexed: {file_count}\n- Last processed message ID: {last_message_id}"
             )
     
     async def process_message(self, message, chat_id):
@@ -229,7 +327,8 @@ class TelegramBot:
                 file_id = message.audio.file_id
                 
             if file_name and file_id:
-                if message.forward_from or message.forward_from_chat:
+                is_forwarded = isinstance(message.forward_origin, (MessageOrigin.User, MessageOrigin.Chat, MessageOrigin.Channel))
+                if is_forwarded:
                     logger.info(f"Processing forwarded file: {file_name} with ID {file_id} for chat {chat_id}")
                 else:
                     logger.info(f"Saving file: {file_name} with ID {file_id} for chat {chat_id}")
@@ -286,11 +385,12 @@ class TelegramBot:
     
     def run(self):
         logger.info("Starting bot")
-        app = Application.builder().token(config.BOT_TOKEN).concurrent_updates(10).connection_pool_size(30).pool_timeout(60).build()
+        app = Application.builder().token(config.BOT_TOKEN).concurrent_updates(10).connection_pool_size(30).pool_timeout(90).build()
         
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("index", self.index))
         app.add_handler(CommandHandler("reindex", self.reindex))
+        app.add_handler(CommandHandler("forward", self.forward))
         app.add_handler(CommandHandler("status", self.status))
         app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_message))
         
