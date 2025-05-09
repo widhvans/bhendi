@@ -1,12 +1,11 @@
 import telegram
-from telegram.ext import Updater, CommandHandler, MessageHandler, filters, CallbackContext
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram import Update
 import config
 from database import Database
 import logging
 import asyncio
 import httpx
-from queue import Queue
 
 # Configure logging to show only necessary logs
 logging.getLogger('httpx').setLevel(logging.WARNING)
@@ -17,78 +16,70 @@ logger = logging.getLogger(__name__)
 class TelegramBot:
     def __init__(self):
         self.db = Database()
-        self.rate_limit_delay = 2  # Delay between batches in seconds
+        self.semaphore = asyncio.Semaphore(5)  # Limit to 5 concurrent API calls
         
-    def start(self, update: Update, context: CallbackContext):
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_chat.type not in ['group', 'supergroup']:
             return
         chat_id = update.effective_chat.id
-        admins = context.bot.get_chat_administrators(chat_id)
+        admins = await context.bot.get_chat_administrators(chat_id)
         bot_id = context.bot.id
         is_admin = any(admin.user.id == bot_id for admin in admins)
         
         if is_admin:
-            update.message.reply_text(
+            await update.message.reply_text(
                 "I'm now an admin! 🎉\n"
                 "Available command:\n"
                 "/index - Index all media/documents in this group"
             )
     
-    def index(self, update: Update, context: CallbackContext):
+    async def index(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_chat.type not in ['group', 'supergroup']:
             return
             
         chat_id = update.effective_chat.id
         user_id = update.effective_user.id
-        admins = context.bot.get_chat_administrators(chat_id)
+        admins = await context.bot.get_chat_administrators(chat_id)
         
         if not any(admin.user.id == user_id for admin in admins):
-            update.message.reply_text("Only admins can use /index command!")
+            await update.message.reply_text("Only admins can use /index command!")
             return
             
-        status_message = update.message.reply_text("Starting indexing process... [0 files indexed]")
-        context.job_queue.run_once(self._index_messages, 0, data={
-            'chat_id': chat_id,
-            'status_message': status_message,
-            'processed': 0
-        })
-    
-    def _index_messages(self, context: CallbackContext):
-        job = context.job
-        chat_id = job.data['chat_id']
-        status_message = job.data['status_message']
-        processed = job.data['processed']
+        status_message = await update.message.reply_text("Starting indexing process... [0 files indexed]")
+        processed = 0
         
         try:
-            # Process messages in batches
-            messages = context.bot.get_chat_history(chat_id=chat_id, limit=100)
-            batch_processed = 0
-            
-            for message in messages:
-                if self.process_message(message, chat_id):
-                    batch_processed += 1
-                    processed += 1
+            offset = 0
+            while True:
+                async with self.semaphore:
+                    updates = await context.bot.get_updates(offset=offset, timeout=30)
+                if not updates:
+                    break
                     
-                    if processed % 100 == 0:
-                        status_message.edit_text(f"Indexing... [{processed} files indexed]")
-                        # Yield control to event loop
-                        asyncio.get_event_loop().run_until_complete(asyncio.sleep(self.rate_limit_delay))
-            
-            if batch_processed > 0:
-                # Schedule next batch
-                context.job_queue.run_once(self._index_messages, self.rate_limit_delay, data={
-                    'chat_id': chat_id,
-                    'status_message': status_message,
-                    'processed': processed
-                })
-            else:
-                status_message.edit_text(f"Indexing complete! {processed} files indexed.")
+                batch_processed = 0
+                for update in updates:
+                    offset = max(offset, update.update_id + 1)
+                    if update.message and update.message.chat_id == chat_id:
+                        if await self.process_message(update.message, chat_id):
+                            batch_processed += 1
+                            processed += 1
+                            
+                            if processed % 100 == 0:
+                                await status_message.edit_text(f"Indexing... [{processed} files indexed]")
+                                await asyncio.sleep(10)  # Update every 10 seconds or 100 files
                 
+                if batch_processed == 0 and len(updates) < 100:
+                    break
+                    
+                await asyncio.sleep(2)  # Rate limit between batches
+                
+            await status_message.edit_text(f"Indexing complete! {processed} files indexed.")
+            
         except Exception as e:
             logger.error(f"Indexing error: {str(e)}")
-            status_message.edit_text(f"Error during indexing: {str(e)}")
+            await status_message.edit_text(f"Error during indexing: {str(e)}")
     
-    def process_message(self, message, chat_id):
+    async def process_message(self, message, chat_id):
         if message.document or message.photo or message.video or message.audio:
             file_name = None
             file_id = None
@@ -111,7 +102,7 @@ class TelegramBot:
                 return True
         return False
     
-    def handle_message(self, update: Update, context: CallbackContext):
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_chat.type not in ['group', 'supergroup']:
             return
             
@@ -120,7 +111,7 @@ class TelegramBot:
         
         # Handle new files
         if message.document or message.photo or message.video or message.audio:
-            self.process_message(message, chat_id)
+            await self.process_message(message, chat_id)
             return
             
         # Handle search queries
@@ -130,34 +121,33 @@ class TelegramBot:
             
             if files:
                 for file in files:
-                    context.bot.send_document(
-                        chat_id=chat_id,
-                        document=file['file_id'],
-                        caption=f"Found: {file['file_name']}"
-                    )
+                    async with self.semaphore:
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=file['file_id'],
+                            caption=f"Found: {file['file_name']}"
+                        )
             else:
-                admins = context.bot.get_chat_administrators(chat_id)
+                admins = await context.bot.get_chat_administrators(chat_id)
                 for admin in admins:
                     if admin.user.id != context.bot.id:  # Don't PM the bot itself
-                        context.bot.send_message(
-                            chat_id=admin.user.id,
-                            text=f"File '{search_term}' not found in group {update.effective_chat.title}. Requested by @{update.effective_user.username}"
-                        )
-                update.message.reply_text(
+                        async with self.semaphore:
+                            await context.bot.send_message(
+                                chat_id=admin.user.id,
+                                text=f"File '{search_term}' not found in group {update.effective_chat.title}. Requested by @{update.effective_user.username}"
+                            )
+                await message.reply_text(
                     f"File '{search_term}' not found! Notification sent to admins."
                 )
     
     def run(self):
-        update_queue = Queue()
-        updater = Updater(config.BOT_TOKEN, update_queue)
+        app = Application.builder().token(config.BOT_TOKEN).build()
         
-        dp = updater.dispatcher
-        dp.add_handler(CommandHandler("start", self.start))
-        dp.add_handler(CommandHandler("index", self.index))
-        dp.add_handler(MessageHandler(filters.all & ~filters.command, self.handle_message))
+        app.add_handler(CommandHandler("start", self.start))
+        app.add_handler(CommandHandler("index", self.index))
+        app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_message))
         
-        updater.start_polling(poll_interval=2.0, timeout=30)
-        updater.idle()
+        app.run_polling(poll_interval=2.0, timeout=30)
 
 if __name__ == '__main__':
     bot = TelegramBot()
