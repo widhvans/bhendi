@@ -1,5 +1,19 @@
 from pymongo import MongoClient
 import config
+import logging
+
+# Configure logging for database.py
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # Console output
+        logging.FileHandler('bot.log')  # File output
+    ]
+)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('telegram').setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
 class Database:
     def __init__(self):
