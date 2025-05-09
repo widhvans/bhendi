@@ -1,7 +1,7 @@
 import telegram
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram import Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 import config
 from database import Database
 import logging
@@ -74,11 +74,15 @@ class TelegramBot:
         processed = 0
         
         try:
-            latest_message_id = None
+            # Get the latest message ID to start fetching history
+            async with self.semaphore:
+                chat = await context.bot.get_chat(chat_id)
+                latest_message_id = None  # Start from the latest message
+            
             while True:
-                logger.info(f"Fetching messages for chat {chat_id}, latest_message_id: {latest_message_id}")
+                logger.info(f"Fetching messages for chat {chat_id}, from_message_id: {latest_message_id}")
                 async with self.semaphore:
-                    # Use _post to call getChatHistory (not directly available in v20.7)
+                    # Fetch messages using getChatHistory via raw API call
                     response = await context.bot._post(
                         'getChatHistory',
                         data={
@@ -95,7 +99,6 @@ class TelegramBot:
                     
                 batch_processed = 0
                 for message in messages:
-                    # Convert raw message dict to Message object
                     message_obj = telegram.Message.de_json(message, context.bot)
                     if message_obj and await self.process_message(message_obj, chat_id):
                         batch_processed += 1
@@ -112,7 +115,7 @@ class TelegramBot:
                     break
                     
                 latest_message_id = messages[-1]['message_id']
-                logger.info(f"Pausing 2 seconds before next batch, next latest_message_id: {latest_message_id}")
+                logger.info(f"Pausing 2 seconds before next batch, next from_message_id: {latest_message_id}")
                 await asyncio.sleep(2)  # Rate limit between batches
                 
             logger.info(f"Indexing complete for chat {chat_id}, {processed} files indexed")
@@ -125,6 +128,13 @@ class TelegramBot:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=f"Error during indexing: {str(e)}"
+                )
+        except TelegramError as e:
+            logger.error(f"Telegram API error during indexing: {str(e)}")
+            async with self.semaphore:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Telegram API error during indexing: {str(e)}. Ensure the bot has permission to read chat history."
                 )
         except Exception as e:
             logger.error(f"Unexpected error during indexing: {str(e)}")
