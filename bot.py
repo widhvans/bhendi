@@ -62,7 +62,8 @@ class TelegramBot:
                             
                             # Update progress every 10 seconds or every 100 files
                             if processed % 100 == 0:
-                                await status     await status_message.edit_text(f"Indexing... [{processed} files indexed]")
+                                await status     
+                                await status_message.edit_text(f"Indexing... [{processed} files indexed]")
                                 await asyncio.sleep(10)
                                 
                 if len(updates) < 100:  # If we got less than 100 updates, we're likely done
