@@ -1,6 +1,7 @@
 import telegram
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram import Update
+from telegram.error import BadRequest
 import config
 from database import Database
 import logging
@@ -22,16 +23,17 @@ class TelegramBot:
         if update.effective_chat.type not in ['group', 'supergroup']:
             return
         chat_id = update.effective_chat.id
-        admins = await context.bot.get_chat_administrators(chat_id)
+        async with self.semaphore:
+            admins = await context.bot.get_chat_administrators(chat_id)
         bot_id = context.bot.id
         is_admin = any(admin.user.id == bot_id for admin in admins)
         
         if is_admin:
-            await update.message.reply_text(
-                "I'm now an admin! 🎉\n"
-                "Available command:\n"
-                "/index - Index all media/documents in this group"
-            )
+            async with self.semaphore:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="I'm now an admin! 🎉\nAvailable command:\n/index - Index all media/documents in this group"
+                )
     
     async def index(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_chat.type not in ['group', 'supergroup']:
@@ -39,13 +41,22 @@ class TelegramBot:
             
         chat_id = update.effective_chat.id
         user_id = update.effective_user.id
-        admins = await context.bot.get_chat_administrators(chat_id)
+        async with self.semaphore:
+            admins = await context.bot.get_chat_administrators(chat_id)
         
         if not any(admin.user.id == user_id for admin in admins):
-            await update.message.reply_text("Only admins can use /index command!")
+            async with self.semaphore:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="Only admins can use /index command!"
+                )
             return
             
-        status_message = await update.message.reply_text("Starting indexing process... [0 files indexed]")
+        async with self.semaphore:
+            status_message = await context.bot.send_message(
+                chat_id=chat_id,
+                text="Starting indexing process... [0 files indexed]"
+            )
         processed = 0
         
         try:
@@ -65,7 +76,8 @@ class TelegramBot:
                             processed += 1
                             
                             if processed % 100 == 0:
-                                await status_message.edit_text(f"Indexing... [{processed} files indexed]")
+                                async with self.semaphore:
+                                    await status_message.edit_text(f"Indexing... [{processed} files indexed]")
                                 await asyncio.sleep(10)  # Update every 10 seconds or 100 files
                 
                 if batch_processed == 0 and len(updates) < 100:
@@ -73,11 +85,23 @@ class TelegramBot:
                     
                 await asyncio.sleep(2)  # Rate limit between batches
                 
-            await status_message.edit_text(f"Indexing complete! {processed} files indexed.")
+            async with self.semaphore:
+                await status_message.edit_text(f"Indexing complete! {processed} files indexed.")
             
+        except BadRequest as e:
+            logger.error(f"BadRequest during indexing: {str(e)}")
+            async with self.semaphore:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Error during indexing: {str(e)}"
+                )
         except Exception as e:
-            logger.error(f"Indexing error: {str(e)}")
-            await status_message.edit_text(f"Error during indexing: {str(e)}")
+            logger.error(f"Unexpected error during indexing: {str(e)}")
+            async with self.semaphore:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Unexpected error during indexing: {str(e)}"
+                )
     
     async def process_message(self, message, chat_id):
         if message.document or message.photo or message.video or message.audio:
@@ -128,7 +152,8 @@ class TelegramBot:
                             caption=f"Found: {file['file_name']}"
                         )
             else:
-                admins = await context.bot.get_chat_administrators(chat_id)
+                async with self.semaphore:
+                    admins = await context.bot.get_chat_administrators(chat_id)
                 for admin in admins:
                     if admin.user.id != context.bot.id:  # Don't PM the bot itself
                         async with self.semaphore:
@@ -136,9 +161,11 @@ class TelegramBot:
                                 chat_id=admin.user.id,
                                 text=f"File '{search_term}' not found in group {update.effective_chat.title}. Requested by @{update.effective_user.username}"
                             )
-                await message.reply_text(
-                    f"File '{search_term}' not found! Notification sent to admins."
-                )
+                async with self.semaphore:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"File '{search_term}' not found! Notification sent to admins."
+                    )
     
     def run(self):
         app = Application.builder().token(config.BOT_TOKEN).build()
