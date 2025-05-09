@@ -137,10 +137,7 @@ class TelegramBot:
                 )
     
     def run(self):
-        app = Application.builder().token(config.BOT_TOKEN).build(
-            connection_pool_size=20,  # Increase pool size
-            pool_timeout=30  # Increase timeout
-        )
+        app = Application.builder().token(config.BOT_TOKEN).build()
         
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("index", self.index))
