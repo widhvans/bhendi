@@ -147,7 +147,7 @@ class TelegramBot:
                 )
     
     def run(self):
-        updater = Updater(config.BOT_TOKEN, use_context=True)
+        updater = Updater(config.BOT_TOKEN)
         
         dp = updater.dispatcher
         dp.add_handler(CommandHandler("start", self.start))
