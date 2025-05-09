@@ -42,7 +42,7 @@ class TelegramBot:
             async with self.semaphore:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text="I'm now an admin! 🎉\nAvailable command:\n/index - Index all media/documents in this group"
+                    text="I'm now an admin! 🎉\nAvailable commands:\n/index - Index all media/documents\n/reindex - Reindex after forwarding old files"
                 )
     
     async def index(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -74,46 +74,22 @@ class TelegramBot:
         processed = 0
         
         try:
-            # Send a dummy message to get a reference point
-            async with self.semaphore:
-                dummy_message = await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="Indexing in progress..."
-                )
-            latest_message_id = dummy_message.message_id
-            
-            while latest_message_id > 1:
-                logger.info(f"Fetching messages for chat {chat_id}, up to message_id: {latest_message_id}")
+            offset = 0
+            while True:
+                logger.info(f"Fetching updates with offset {offset}")
                 async with self.semaphore:
-                    # Fetch messages by sending messages with reply_to_message_id
-                    messages = []
-                    for i in range(100):
-                        target_id = latest_message_id - i
-                        if target_id < 1:
-                            break
-                        try:
-                            async with self.semaphore:
-                                response = await context.bot._post(
-                                    'getMessage',
-                                    data={
-                                        'chat_id': chat_id,
-                                        'message_id': target_id
-                                    }
-                                )
-                            if response.get('ok'):
-                                messages.append(response['result'])
-                        except TelegramError as e:
-                            logger.warning(f"Failed to fetch message {target_id}: {str(e)}")
-                            continue
-                
-                if not messages:
-                    logger.info("No more messages fetched")
+                    updates = await context.bot.get_updates(offset=offset, timeout=30)
+                if not updates:
+                    logger.info("No more updates available")
                     break
                     
                 batch_processed = 0
-                for message in messages:
-                    message_obj = telegram.Message.de_json(message, context.bot)
-                    if message_obj and await self.process_message(message_obj, chat_id):
+                chat_messages = [u for u in updates if u.message and u.message.chat_id == chat_id]
+                logger.info(f"Found {len(chat_messages)} messages for chat {chat_id} in this batch")
+                
+                for update in chat_messages:
+                    offset = max(offset, update.update_id + 1)
+                    if await self.process_message(update.message, chat_id):
                         batch_processed += 1
                         processed += 1
                         
@@ -123,21 +99,22 @@ class TelegramBot:
                                 await status_message.edit_text(f"Indexing... [{processed} files indexed]")
                             await asyncio.sleep(10)  # Update every 10 seconds or 100 files
                 
-                if batch_processed == 0 or len(messages) < 100:
-                    logger.info("No new files processed or fewer than 100 messages, stopping")
+                if batch_processed == 0 and len(chat_messages) == 0:
+                    logger.info("No new files processed and no relevant messages, stopping")
                     break
                     
-                latest_message_id = min(m['message_id'] for m in messages)
-                logger.info(f"Pausing 2 seconds before next batch, next max message_id: {latest_message_id}")
+                logger.info(f"Pausing 2 seconds before next batch, next offset: {offset}")
                 await asyncio.sleep(2)  # Rate limit between batches
-                
-            # Clean up dummy message
-            async with self.semaphore:
-                await context.bot.delete_message(chat_id=chat_id, message_id=dummy_message.message_id)
                 
             logger.info(f"Indexing complete for chat {chat_id}, {processed} files indexed")
             async with self.semaphore:
                 await status_message.edit_text(f"Indexing complete! {processed} files indexed.")
+                if processed == 0:
+                    admin_mentions = ' '.join([f"@{admin.user.username}" for admin in admins if admin.user.username])
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"No files indexed. {admin_mentions}, please forward old media files to the group and use /reindex."
+                    )
             
         except BadRequest as e:
             logger.error(f"BadRequest during indexing: {str(e)}")
@@ -151,7 +128,7 @@ class TelegramBot:
             async with self.semaphore:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"Telegram API error during indexing: {str(e)}. Ensure the bot has permission to read chat history."
+                    text=f"Telegram API error during indexing: {str(e)}. Ensure the bot has permission to read chat history or forward old files and use /reindex."
                 )
         except Exception as e:
             logger.error(f"Unexpected error during indexing: {str(e)}")
@@ -160,6 +137,11 @@ class TelegramBot:
                     chat_id=chat_id,
                     text=f"Unexpected error during indexing: {str(e)}"
                 )
+    
+    async def reindex(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info("Received /reindex command")
+        # Reuse index logic
+        await self.index(update, context)
     
     async def process_message(self, message, chat_id):
         if message.document or message.photo or message.video or message.audio:
@@ -238,6 +220,7 @@ class TelegramBot:
         
         app.add_handler(CommandHandler("start", self.start))
         app.add_handler(CommandHandler("index", self.index))
+        app.add_handler(CommandHandler("reindex", self.reindex))
         app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_message))
         
         logger.info("Running polling")
