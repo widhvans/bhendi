@@ -74,34 +74,45 @@ class TelegramBot:
         processed = 0
         
         try:
-            offset = 0
+            latest_message_id = None
             while True:
-                logger.info(f"Fetching updates with offset {offset}")
+                logger.info(f"Fetching messages for chat {chat_id}, latest_message_id: {latest_message_id}")
                 async with self.semaphore:
-                    updates = await context.bot.get_updates(offset=offset, timeout=30)
-                if not updates:
-                    logger.info("No more updates to process")
+                    # Use _post to call getChatHistory (not directly available in v20.7)
+                    response = await context.bot._post(
+                        'getChatHistory',
+                        data={
+                            'chat_id': chat_id,
+                            'from_message_id': latest_message_id,
+                            'limit': 100
+                        }
+                    )
+                
+                messages = response.get('messages', [])
+                if not messages:
+                    logger.info("No more messages to process")
                     break
                     
                 batch_processed = 0
-                for update in updates:
-                    offset = max(offset, update.update_id + 1)
-                    if update.message and update.message.chat_id == chat_id:
-                        if await self.process_message(update.message, chat_id):
-                            batch_processed += 1
-                            processed += 1
-                            
-                            if processed % 100 == 0:
-                                logger.info(f"Processed {processed} files, updating status")
-                                async with self.semaphore:
-                                    await status_message.edit_text(f"Indexing... [{processed} files indexed]")
-                                await asyncio.sleep(10)  # Update every 10 seconds or 100 files
+                for message in messages:
+                    # Convert raw message dict to Message object
+                    message_obj = telegram.Message.de_json(message, context.bot)
+                    if message_obj and await self.process_message(message_obj, chat_id):
+                        batch_processed += 1
+                        processed += 1
+                        
+                        if processed % 100 == 0:
+                            logger.info(f"Processed {processed} files, updating status")
+                            async with self.semaphore:
+                                await status_message.edit_text(f"Indexing... [{processed} files indexed]")
+                            await asyncio.sleep(10)  # Update every 10 seconds or 100 files
                 
-                if batch_processed == 0 and len(updates) < 100:
-                    logger.info("No new files processed and fewer than 100 updates, stopping")
+                if batch_processed == 0 or len(messages) < 100:
+                    logger.info("No new files processed or fewer than 100 messages, stopping")
                     break
                     
-                logger.info("Pausing 2 seconds before next batch")
+                latest_message_id = messages[-1]['message_id']
+                logger.info(f"Pausing 2 seconds before next batch, next latest_message_id: {latest_message_id}")
                 await asyncio.sleep(2)  # Rate limit between batches
                 
             logger.info(f"Indexing complete for chat {chat_id}, {processed} files indexed")
