@@ -74,27 +74,40 @@ class TelegramBot:
         processed = 0
         
         try:
-            # Get the latest message ID to start fetching history
+            # Send a dummy message to get a reference point
             async with self.semaphore:
-                chat = await context.bot.get_chat(chat_id)
-                latest_message_id = None  # Start from the latest message
+                dummy_message = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="Indexing in progress..."
+                )
+            latest_message_id = dummy_message.message_id
             
-            while True:
-                logger.info(f"Fetching messages for chat {chat_id}, from_message_id: {latest_message_id}")
+            while latest_message_id > 1:
+                logger.info(f"Fetching messages for chat {chat_id}, up to message_id: {latest_message_id}")
                 async with self.semaphore:
-                    # Fetch messages using getChatHistory via raw API call
-                    response = await context.bot._post(
-                        'getChatHistory',
-                        data={
-                            'chat_id': chat_id,
-                            'from_message_id': latest_message_id,
-                            'limit': 100
-                        }
-                    )
+                    # Fetch messages by sending messages with reply_to_message_id
+                    messages = []
+                    for i in range(100):
+                        target_id = latest_message_id - i
+                        if target_id < 1:
+                            break
+                        try:
+                            async with self.semaphore:
+                                response = await context.bot._post(
+                                    'getMessage',
+                                    data={
+                                        'chat_id': chat_id,
+                                        'message_id': target_id
+                                    }
+                                )
+                            if response.get('ok'):
+                                messages.append(response['result'])
+                        except TelegramError as e:
+                            logger.warning(f"Failed to fetch message {target_id}: {str(e)}")
+                            continue
                 
-                messages = response.get('messages', [])
                 if not messages:
-                    logger.info("No more messages to process")
+                    logger.info("No more messages fetched")
                     break
                     
                 batch_processed = 0
@@ -114,9 +127,13 @@ class TelegramBot:
                     logger.info("No new files processed or fewer than 100 messages, stopping")
                     break
                     
-                latest_message_id = messages[-1]['message_id']
-                logger.info(f"Pausing 2 seconds before next batch, next from_message_id: {latest_message_id}")
+                latest_message_id = min(m['message_id'] for m in messages)
+                logger.info(f"Pausing 2 seconds before next batch, next max message_id: {latest_message_id}")
                 await asyncio.sleep(2)  # Rate limit between batches
+                
+            # Clean up dummy message
+            async with self.semaphore:
+                await context.bot.delete_message(chat_id=chat_id, message_id=dummy_message.message_id)
                 
             logger.info(f"Indexing complete for chat {chat_id}, {processed} files indexed")
             async with self.semaphore:
