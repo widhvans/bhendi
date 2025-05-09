@@ -39,6 +39,7 @@ class Database:
         return self.files.count_documents({'chat_id': chat_id})
     
     def save_indexed_offset(self, chat_id, offset):
+        logger.info(f"Saving last indexed offset {offset} for chat {chat_id}")
         self.index_state.update_one(
             {'chat_id': chat_id},
             {'$set': {'last_offset': offset}},
@@ -47,7 +48,23 @@ class Database:
     
     def get_last_indexed_offset(self, chat_id):
         state = self.index_state.find_one({'chat_id': chat_id})
-        return state.get('last_offset', 0) if state else 0
+        offset = state.get('last_offset', 0) if state else 0
+        logger.info(f"Retrieved last indexed offset {offset} for chat {chat_id}")
+        return offset
+    
+    def save_indexed_message_id(self, chat_id, message_id):
+        logger.info(f"Saving last indexed message_id {message_id} for chat {chat_id}")
+        self.index_state.update_one(
+            {'chat_id': chat_id},
+            {'$set': {'last_message_id': message_id}},
+            upsert=True
+        )
+    
+    def get_last_indexed_message_id(self, chat_id):
+        state = self.index_state.find_one({'chat_id': chat_id})
+        message_id = state.get('last_message_id', 0) if state else 0
+        logger.info(f"Retrieved last indexed message_id {message_id} for chat {chat_id}")
+        return message_id
     
     def close(self):
         self.client.close()
