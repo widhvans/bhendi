@@ -51,7 +51,7 @@ class TelegramBot:
                         self.indexing_requests[user_id] = forward_chat.id
                         self.logger.info(f"User {user_id} forwarded message from chat {forward_chat.id} for indexing")
                         await update.message.reply_text(f"Starting to index all files from chat {forward_chat.id}...")
-                        await self.index_all_files(context, forward_chat.id, user_id)
+                        await self.index_all_files(context, forward_chat.id, user_id, message.message_id)
                         del self.indexing_requests[user_id]
                     else:
                         self.logger.warning(f"Bot is not admin in forwarded chat {forward_chat.id}")
@@ -167,18 +167,31 @@ class TelegramBot:
         except Exception as e:
             self.logger.error(f"Error indexing file in chat {target_chat_id}: {str(e)}")
 
-    async def index_all_files(self, context, chat_id, user_id):
+    async def index_all_files(self, context, chat_id, user_id, last_message_id):
         try:
-            # Fetch chat history (up to 100 messages, adjustable)
-            messages = []
-            async for message in context.bot.get_chat_history(chat_id, limit=100):
-                if message.document or message.video or message.audio or message.photo:
-                    messages.append(message)
+            message_id = last_message_id
+            messages_processed = 0
+            max_messages = 100  # Limit to avoid rate limits
 
-            for message in messages:
-                await self.index_file(message, context, chat_id, is_forwarded=True, user_id=user_id)
-            self.logger.info(f"Completed indexing all files for chat {chat_id}")
-            await context.bot.send_message(user_id, f"Finished indexing all files for chat {chat_id}.")
+            while messages_processed < max_messages:
+                try:
+                    message = await context.bot.get_message(chat_id, message_id)
+                    if message.document or message.video or message.audio or message.photo:
+                        await self.index_file(message, context, chat_id, is_forwarded=True, user_id=user_id)
+                    message_id -= 1
+                    messages_processed += 1
+                except telegram.error.BadRequest as e:
+                    if "Message_id_invalid" in str(e):
+                        break  # No more messages
+                    self.logger.warning(f"Error fetching message {message_id} in chat {chat_id}: {str(e)}")
+                    message_id -= 1
+                    messages_processed += 1
+                except Exception as e:
+                    self.logger.error(f"Error processing message {message_id} in chat {chat_id}: {str(e)}")
+                    break
+
+            self.logger.info(f"Completed indexing {messages_processed} messages for chat {chat_id}")
+            await context.bot.send_message(user_id, f"Finished indexing files for chat {chat_id}. Processed {messages_processed} messages.")
         except Exception as e:
             self.logger.error(f"Error indexing all files for chat {chat_id}: {str(e)}")
             await context.bot.send_message(user_id, f"Error indexing files for chat {chat_id}: {str(e)}")
