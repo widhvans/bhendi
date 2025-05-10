@@ -13,7 +13,7 @@ class TelegramBot:
         self.db = Database()
         self.app = Application.builder().token(config.BOT_TOKEN).build()
         self.last_update = datetime.now()
-        self.indexing_requests = {}  # Store user_id: chat_id for /index command
+        self.indexing_requests = {}  # Store user_id: {chat_id, files, processed_ids}
         self.logger.info("Bot initialized")
 
     async def start(self, update, context):
@@ -26,17 +26,23 @@ class TelegramBot:
             self.logger.debug(f"Ignoring /index command from non-private chat {update.message.chat_id}")
             await update.message.reply_text("Please use /index in my private chat.")
             return
-        self.indexing_requests[user_id] = None
+        self.indexing_requests[user_id] = {'chat_id': None, 'files': [], 'processed_ids': set()}
         self.logger.info(f"/index command received from user {user_id}")
         await update.message.reply_text("Please forward all file messages (documents, videos, audios, photos) from the group/channel where I'm an admin. Send /done when finished.")
 
     async def done_command(self, update, context):
         user_id = update.message.from_user.id
         if user_id in self.indexing_requests:
-            chat_id = self.indexing_requests[user_id]
+            chat_id = self.indexing_requests[user_id]['chat_id']
+            files = self.indexing_requests[user_id]['files']
+            if chat_id and files:
+                # Sort files by timestamp in descending order
+                files.sort(key=lambda x: x['message'].date, reverse=True)
+                for file_info in files:
+                    await self.index_file(file_info['message'], context, chat_id, is_forwarded=True, user_id=user_id)
+            self.logger.info(f"User {user_id} finished indexing for chat {chat_id or 'unknown'}")
+            await update.message.reply_text(f"Finished indexing files for chat {chat_id or 'unknown'}. Indexed {len(files)} files.")
             del self.indexing_requests[user_id]
-            self.logger.info(f"User {user_id} finished indexing for chat {chat_id}")
-            await update.message.reply_text(f"Finished indexing files for chat {chat_id or 'unknown'}.")
         else:
             self.logger.debug(f"/done command from user {user_id} with no active indexing")
             await update.message.reply_text("No active indexing session.")
@@ -59,11 +65,17 @@ class TelegramBot:
                 try:
                     bot_member = await context.bot.get_chat_member(forward_chat.id, context.bot.id)
                     if bot_member.status == 'administrator':
-                        if self.indexing_requests[user_id] is None:
-                            self.indexing_requests[user_id] = forward_chat.id
+                        if self.indexing_requests[user_id]['chat_id'] is None:
+                            self.indexing_requests[user_id]['chat_id'] = forward_chat.id
                             self.logger.info(f"User {user_id} started indexing for chat {forward_chat.id}")
                         if message.document or message.video or message.audio or message.photo:
-                            await self.index_file(message, context, forward_chat.id, is_forwarded=True, user_id=user_id)
+                            file_id = self.get_file_id(message)
+                            if file_id and file_id not in self.indexing_requests[user_id]['processed_ids']:
+                                self.indexing_requests[user_id]['files'].append({'message': message})
+                                self.indexing_requests[user_id]['processed_ids'].add(file_id)
+                                self.logger.debug(f"Added file {file_id} to indexing queue for chat {forward_chat.id}")
+                            else:
+                                self.logger.debug(f"Skipped duplicate or non-media file {file_id or 'None'} in chat {forward_chat.id}")
                         else:
                             await update.message.reply_text("Please forward a message containing a file (document, video, audio, or photo).")
                     else:
@@ -85,9 +97,10 @@ class TelegramBot:
                     if bot_member.status == 'administrator':
                         if message.document or message.video or message.audio or message.photo:
                             await self.index_file(message, context, forward_chat.id, is_forwarded=True, user_id=user_id)
+                    else:
+                        self.logger.warning(f"Bot is not admin in forwarded chat {forward_chat.id}")
                 except telegram.error.Forbidden as e:
                     self.logger.error(f"Cannot access forwarded chat {forward_chat.id}: {str(e)}")
-                    return
             return
 
         # Handle direct messages in groups/channels
@@ -109,6 +122,17 @@ class TelegramBot:
 
         if message.text:
             await self.handle_search(message, context)
+
+    def get_file_id(self, message):
+        if message.document:
+            return message.document.file_id
+        elif message.video:
+            return message.video.file_id
+        elif message.audio:
+            return message.audio.file_id
+        elif message.photo:
+            return message.photo[-1].file_id
+        return None
 
     async def index_file(self, message, context, target_chat_id, is_forwarded=False, user_id=None):
         chat_id = message.chat_id
@@ -161,13 +185,19 @@ class TelegramBot:
                 }
 
             if file_info:
-                # Skip duplicate check for forwarded files
-                if not is_forwarded and self.db.file_exists(file_info['file_id']):
-                    self.logger.debug(f"Skipped duplicate file {file_info['name']} (ID: {file_info['file_id']}) in chat {target_chat_id}")
-                    return
+                # For direct files, check for duplicates
+                if not is_forwarded:
+                    existing_file = self.db.files.find_one({'file_id': file_info['file_id']})
+                    if existing_file:
+                        self.logger.debug(f"Skipped duplicate file {file_info['name']} (ID: {file_info['file_id']}) in chat {target_chat_id}")
+                        return
 
-                # Remove existing file with same file_id to avoid duplicate key error
+                # For forwarded files, check timestamp to ensure newer file
                 if is_forwarded:
+                    existing_file = self.db.files.find_one({'file_id': file_info['file_id']})
+                    if existing_file and existing_file['timestamp'] >= file_info['timestamp']:
+                        self.logger.debug(f"Skipped older or same file {file_info['name']} (ID: {file_info['file_id']}) in chat {target_chat_id}")
+                        return
                     self.db.files.delete_one({'file_id': file_info['file_id']})
 
                 self.db.save_file(file_info)
