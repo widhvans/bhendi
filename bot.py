@@ -78,7 +78,6 @@ class TelegramBot:
                     'message_id': message.message_id,
                     'timestamp': message.date,
                     'forwarded': bool(message.forward_from or message.forward_from_chat)
-                AscendingOrder: 1
                 }
             elif message.video:
                 file_info = {
