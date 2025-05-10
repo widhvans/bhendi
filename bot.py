@@ -20,7 +20,7 @@ class TelegramBot:
 
     async def start(self, update, context):
         self.logger.info(f"Start command received from user {update.message.from_user.id}")
-        await update.message.reply_text("Bot started! Send file names to search, forward group/channel files to index, or use /index to index files from a chat.")
+        await update.message.reply_text("Bot started! Send file names to search, forward group/channel files to index, or use /index to index previous files from a chat.")
 
     async def index_command(self, update, context):
         user_id = update.message.from_user.id
@@ -57,14 +57,12 @@ class TelegramBot:
                             if file_id and file_id not in self.indexing_requests[user_id]['processed_ids']:
                                 await self.index_file(message, context, forward_chat.id, is_forwarded=True, user_id=user_id)
                                 self.indexing_requests[user_id]['processed_ids'].add(file_id)
-                                # Extract message ID from forwarded message
-                                message_id = message.forward_from_message_id if message.forward_from_message_id else message.message_id
-                                await self.index_previous_files(context, forward_chat.id, user_id, message_id)
-                            else:
-                                self.logger.debug(f"Skipped duplicate or non-media file {file_id or 'None'} in chat {forward_chat.id}")
-                                await self.index_previous_files(context, forward_chat.id, user_id, message.message_id)
+                            # Extract message ID from forwarded message
+                            message_id = message.forward_from_message_id if message.forward_from_message_id else message.message_id
+                            await self.index_previous_files(context, forward_chat.id, user_id, message_id)
                         else:
                             await update.message.reply_text("Please forward a message containing a file (document, video, audio, or photo).")
+                            await self.index_previous_files(context, forward_chat.id, user_id, message.message_id)
                         await context.bot.send_message(user_id, f"Finished indexing files for chat {forward_chat.id}.")
                         del self.indexing_requests[user_id]
                     else:
@@ -200,10 +198,7 @@ class TelegramBot:
                 self.logger.info(f"Indexed file {file_info['name']} (ID: {file_info['file_id']}) in chat {target_chat_id}{' (forwarded)' if is_forwarded else ''}")
                 if user_id:
                     await context.bot.send_message(user_id, "✅")
-                if user_id:
                     await self.update_indexing_status(context, target_chat_id, user_id)
-                else:
-                    await self.update_indexing_status(context, target_chat_id)
         except Exception as e:
             self.logger.error(f"Error indexing file in chat {target_chat_id}: {str(e)}")
 
@@ -230,7 +225,7 @@ class TelegramBot:
                     message_data = data['result']
                     message = telegram.Message.de_json(message_data, context.bot)
 
-                    if message.document or message.video or message.audio or message.photo:
+                    if message and (message.document or message.video or message.audio or message.photo):
                         file_id = self.get_file_id(message)
                         if file_id and file_id not in processed_ids:
                             await self.index_file(message, context, chat_id, is_forwarded=True, user_id=user_id)
@@ -242,16 +237,18 @@ class TelegramBot:
 
                     message_id -= 1
                     messages_processed += 1
-                    await asyncio.sleep(0.1)  # Avoid rate limits
+                    await asyncio.sleep(0.2)  # Increased delay to avoid rate limits
                 except requests.exceptions.RequestException as e:
                     self.logger.warning(f"Error fetching message {message_id} in chat {chat_id}: {str(e)}")
                     message_id -= 1
                     messages_processed += 1
+                    await asyncio.sleep(0.5)  # Extra delay on error
                 except Exception as e:
                     self.logger.error(f"Error processing message {message_id} in chat {chat_id}: {str(e)}")
                     break
 
             self.logger.info(f"Completed indexing {messages_processed} messages for chat {chat_id}")
+            await context.bot.send_message(user_id, f"Finished indexing files for chat {chat_id}. Processed {messages_processed} messages.")
         except Exception as e:
             self.logger.error(f"Error indexing previous files for chat {chat_id}: {str(e)}")
             await context.bot.send_message(user_id, f"Error indexing files for chat {chat_id}: {str(e)}")
