@@ -13,11 +13,22 @@ class TelegramBot:
         self.db = Database()
         self.app = Application.builder().token(config.BOT_TOKEN).build()
         self.last_update = datetime.now()
+        self.indexing_requests = {}  # Store user_id: chat_id for /index command
         self.logger.info("Bot initialized")
 
     async def start(self, update, context):
         self.logger.info(f"Start command received from user {update.message.from_user.id}")
-        await update.message.reply_text("Bot started! Send file names to search or forward group/channel files to index.")
+        await update.message.reply_text("Bot started! Send file names to search, forward group/channel files to index, or use /index to index all files from a chat.")
+
+    async def index_command(self, update, context):
+        user_id = update.message.from_user.id
+        if update.message.chat.type != 'private':
+            self.logger.debug(f"Ignoring /index command from non-private chat {update.message.chat_id}")
+            await update.message.reply_text("Please use /index in my private chat.")
+            return
+        self.indexing_requests[user_id] = None
+        self.logger.info(f"/index command received from user {user_id}")
+        await update.message.reply_text("Please forward the last message from the group/channel where I'm an admin to start indexing all files.")
 
     async def handle_message(self, update, context):
         message = update.message or update.channel_post
@@ -26,8 +37,31 @@ class TelegramBot:
             return
 
         chat_id = message.chat_id
+        user_id = message.from_user.id if message.from_user else None
         is_private = message.chat.type == 'private'
         is_group_or_channel = message.chat.type in ['group', 'supergroup', 'channel']
+
+        # Handle /index forwarded message in private chat
+        if is_private and user_id in self.indexing_requests and (message.forward_from_chat or message.forward_from):
+            forward_chat = message.forward_from_chat
+            if forward_chat and forward_chat.type in ['group', 'supergroup', 'channel']:
+                try:
+                    bot_member = await context.bot.get_chat_member(forward_chat.id, context.bot.id)
+                    if bot_member.status == 'administrator':
+                        self.indexing_requests[user_id] = forward_chat.id
+                        self.logger.info(f"User {user_id} forwarded message from chat {forward_chat.id} for indexing")
+                        await update.message.reply_text(f"Starting to index all files from chat {forward_chat.id}...")
+                        await self.index_all_files(context, forward_chat.id, user_id)
+                        del self.indexing_requests[user_id]
+                    else:
+                        self.logger.warning(f"Bot is not admin in forwarded chat {forward_chat.id}")
+                        await update.message.reply_text("I'm not an admin in that chat.")
+                        del self.indexing_requests[user_id]
+                except telegram.error.Forbidden as e:
+                    self.logger.error(f"Cannot access forwarded chat {forward_chat.id}: {str(e)}")
+                    await update.message.reply_text("I cannot access that chat.")
+                    del self.indexing_requests[user_id]
+            return
 
         # Handle forwarded messages in private chats
         if is_private and (message.forward_from_chat or message.forward_from):
@@ -37,7 +71,7 @@ class TelegramBot:
                     bot_member = await context.bot.get_chat_member(forward_chat.id, context.bot.id)
                     if bot_member.status == 'administrator':
                         if message.document or message.video or message.audio or message.photo:
-                            await self.index_file(message, context, forward_chat.id, is_forwarded=True, user_id=message.from_user.id)
+                            await self.index_file(message, context, forward_chat.id, is_forwarded=True, user_id=user_id)
                 except telegram.error.Forbidden as e:
                     self.logger.error(f"Cannot access forwarded chat {forward_chat.id}: {str(e)}")
                     return
@@ -119,6 +153,10 @@ class TelegramBot:
                     self.logger.debug(f"Skipped duplicate file {file_info['name']} (ID: {file_info['file_id']}) in chat {target_chat_id}")
                     return
 
+                # Remove existing file with same file_id to avoid duplicate key error
+                if is_forwarded:
+                    self.db.files.delete_one({'file_id': file_info['file_id']})
+
                 self.db.save_file(file_info)
                 self.logger.info(f"Indexed file {file_info['name']} (ID: {file_info['file_id']}) in chat {target_chat_id}{' (forwarded)' if is_forwarded else ''}")
                 await context.bot.send_message(target_chat_id, "✅")
@@ -128,6 +166,22 @@ class TelegramBot:
                     await self.update_indexing_status(context, target_chat_id)
         except Exception as e:
             self.logger.error(f"Error indexing file in chat {target_chat_id}: {str(e)}")
+
+    async def index_all_files(self, context, chat_id, user_id):
+        try:
+            # Fetch chat history (up to 100 messages, adjustable)
+            messages = []
+            async for message in context.bot.get_chat_history(chat_id, limit=100):
+                if message.document or message.video or message.audio or message.photo:
+                    messages.append(message)
+
+            for message in messages:
+                await self.index_file(message, context, chat_id, is_forwarded=True, user_id=user_id)
+            self.logger.info(f"Completed indexing all files for chat {chat_id}")
+            await context.bot.send_message(user_id, f"Finished indexing all files for chat {chat_id}.")
+        except Exception as e:
+            self.logger.error(f"Error indexing all files for chat {chat_id}: {str(e)}")
+            await context.bot.send_message(user_id, f"Error indexing files for chat {chat_id}: {str(e)}")
 
     async def handle_search(self, message, context):
         chat_id = message.chat_id
@@ -184,6 +238,7 @@ class TelegramBot:
         self.logger.info("Starting bot polling")
         try:
             self.app.add_handler(CommandHandler("start", self.start))
+            self.app.add_handler(CommandHandler("index", self.index_command))
             self.app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_message))
             self.app.add_error_handler(self.error_handler)
             self.app.run_polling()
