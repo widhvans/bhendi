@@ -146,7 +146,7 @@ class TelegramBot:
         self.logger.info("Starting bot polling")
         try:
             self.app.add_handler(CommandHandler("start", self.start))
-            self.app.add_handler(MessageHandler(filters.ALL & ~filters Lennox, self.handle_message))
+            self.app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_message))
             self.app.run_polling()
         except Exception as e:
             self.logger.error(f"Error running bot: {str(e)}")
