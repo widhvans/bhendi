@@ -25,9 +25,13 @@ class TelegramBot:
             self.logger.debug(f"Ignoring message from non-group chat {chat_id}")
             return
 
-        bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
-        if bot_member.status != 'administrator':
-            self.logger.warning(f"Bot is not admin in chat {chat_id}")
+        try:
+            bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
+            if bot_member.status != 'administrator':
+                self.logger.warning(f"Bot is not admin in chat {chat_id}")
+                return
+        except telegram.error.Forbidden as e:
+            self.logger.error(f"Cannot access chat {chat_id}: {str(e)}")
             return
 
         if update.message.document or update.message.video or update.message.audio or update.message.photo:
@@ -142,11 +146,15 @@ class TelegramBot:
             self.logger.info(f"Updated indexing status for chat {chat_id}: {count} files")
             self.last_update = now
 
+    async def error_handler(self, update, context):
+        self.logger.error(f"Update {update} caused error: {context.error}")
+
     def run(self):
         self.logger.info("Starting bot polling")
         try:
             self.app.add_handler(CommandHandler("start", self.start))
             self.app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_message))
+            self.app.add_error_handler(self.error_handler)
             self.app.run_polling()
         except Exception as e:
             self.logger.error(f"Error running bot: {str(e)}")
