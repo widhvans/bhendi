@@ -117,7 +117,7 @@ class TelegramBot:
                 if not self.db.file_exists(file_info['file_id']):
                     self.db.save_file(file_info)
                     self.logger.info(f"Indexed file {file_info['name']} (ID: {file_info['file_id']}) in chat {target_chat_id}{' (forwarded)' if file_info['forwarded'] else ''}")
-                    await context.bot.send_message(target_chat_id, "✅", reply_to_message_id=message.message_id)
+                    await context.bot.send_message(target_chat_id, "✅")
                     await self.update_indexing_status(context, target_chat_id)
                 else:
                     self.logger.debug(f"Skipped duplicate file {file_info['name']} (ID: {file_info['file_id']}) in chat {target_chat_id}")
