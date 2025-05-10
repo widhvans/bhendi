@@ -17,7 +17,7 @@ class TelegramBot:
 
     async def start(self, update, context):
         self.logger.info(f"Start command received from user {update.message.from_user.id}")
-        await update.message.reply_text("Bot started! Send file names to search in group/channel chats.")
+        await update.message.reply_text("Bot started! Send file names to search or forward group/channel files to index.")
 
     async def handle_message(self, update, context):
         message = update.message or update.channel_post
@@ -26,7 +26,25 @@ class TelegramBot:
             return
 
         chat_id = message.chat_id
-        if message.chat.type not in ['group', 'supergroup', 'channel']:
+        is_private = message.chat.type == 'private'
+        is_group_or_channel = message.chat.type in ['group', 'supergroup', 'channel']
+
+        # Handle forwarded messages in private chats
+        if is_private and (message.forward_from_chat or message.forward_from):
+            forward_chat = message.forward_from_chat
+            if forward_chat and forward_chat.type in ['group', 'supergroup', 'channel']:
+                try:
+                    bot_member = await context.bot.get_chat_member(forward_chat.id, context.bot.id)
+                    if bot_member.status == 'administrator':
+                        if message.document or message.video or message.audio or message.photo:
+                            await self.index_file(message, context, forward_chat.id)
+                except telegram.error.Forbidden as e:
+                    self.logger.error(f"Cannot access forwarded chat {forward_chat.id}: {str(e)}")
+                    return
+            return
+
+        # Handle direct messages in groups/channels
+        if not is_group_or_channel:
             self.logger.debug(f"Ignoring message from non-group/channel chat {chat_id}")
             return
 
@@ -40,12 +58,12 @@ class TelegramBot:
             return
 
         if message.document or message.video or message.audio or message.photo:
-            await self.index_file(message, context)
+            await self.index_file(message, context, chat_id)
 
         if message.text:
             await self.handle_search(message, context)
 
-    async def index_file(self, message, context):
+    async def index_file(self, message, context, target_chat_id):
         chat_id = message.chat_id
         file_info = {}
 
@@ -56,10 +74,11 @@ class TelegramBot:
                     'name': message.document.file_name,
                     'file_id': message.document.file_id,
                     'size': message.document.file_size,
-                    'chat_id': chat_id,
+                    'chat_id': target_chat_id,
                     'message_id': message.message_id,
                     'timestamp': message.date,
                     'forwarded': bool(message.forward_from or message.forward_from_chat)
+                AscendingOrder: 1
                 }
             elif message.video:
                 file_info = {
@@ -67,7 +86,7 @@ class TelegramBot:
                     'name': message.video.file_name or f"video_{message.video.file_id}",
                     'file_id': message.video.file_id,
                     'size': message.video.file_size,
-                    'chat_id': chat_id,
+                    'chat_id': target_chat_id,
                     'message_id': message.message_id,
                     'timestamp': message.date,
                     'forwarded': bool(message.forward_from or message.forward_from_chat)
@@ -78,7 +97,7 @@ class TelegramBot:
                     'name': message.audio.file_name or f"audio_{message.audio.file_id}",
                     'file_id': message.audio.file_id,
                     'size': message.audio.file_size,
-                    'chat_id': chat_id,
+                    'chat_id': target_chat_id,
                     'message_id': message.message_id,
                     'timestamp': message.date,
                     'forwarded': bool(message.forward_from or message.forward_from_chat)
@@ -89,7 +108,7 @@ class TelegramBot:
                     'name': f"photo_{message.photo[-1].file_id}",
                     'file_id': message.photo[-1].file_id,
                     'size': message.photo[-1].file_size,
-                    'chat_id': chat_id,
+                    'chat_id': target_chat_id,
                     'message_id': message.message_id,
                     'timestamp': message.date,
                     'forwarded': bool(message.forward_from or message.forward_from_chat)
@@ -98,12 +117,13 @@ class TelegramBot:
             if file_info:
                 if not self.db.file_exists(file_info['file_id']):
                     self.db.save_file(file_info)
-                    self.logger.info(f"Indexed file {file_info['name']} (ID: {file_info['file_id']}) in chat {chat_id}{' (forwarded)' if file_info['forwarded'] else ''}")
-                    await self.update_indexing_status(context, chat_id)
+                    self.logger.info(f"Indexed file {file_info['name']} (ID: {file_info['file_id']}) in chat {target_chat_id}{' (forwarded)' if file_info['forwarded'] else ''}")
+                    await context.bot.send_message(target_chat_id, "✅", reply_to_message_id=message.message_id)
+                    await self.update_indexing_status(context, target_chat_id)
                 else:
-                    self.logger.debug(f"Skipped duplicate file {file_info['name']} (ID: {file_info['file_id']}) in chat {chat_id}")
+                    self.logger.debug(f"Skipped duplicate file {file_info['name']} (ID: {file_info['file_id']}) in chat {target_chat_id}")
         except Exception as e:
-            self.logger.error(f"Error indexing file in chat {chat_id}: {str(e)}")
+            self.logger.error(f"Error indexing file in chat {target_chat_id}: {str(e)}")
 
     async def handle_search(self, message, context):
         chat_id = message.chat_id
@@ -130,11 +150,15 @@ class TelegramBot:
             else:
                 admins = await context.bot.get_chat_administrators(chat_id)
                 for admin in admins:
-                    await context.bot.send_message(
-                        admin.user.id,
-                        f"File '{query}' not found in chat {chat_id}"
-                    )
-                    self.logger.info(f"Notified admin {admin.user.id} about missing file '{query}'")
+                    if not admin.user.is_bot:  # Skip bot admins
+                        try:
+                            await context.bot.send_message(
+                                admin.user.id,
+                                f"File '{query}' not found in chat {chat_id}"
+                            )
+                            self.logger.info(f"Notified admin {admin.user.id} about missing file '{query}'")
+                        except telegram.error.Forbidden as e:
+                            self.logger.warning(f"Cannot notify admin {admin.user.id}: {str(e)}")
                 await message.reply_text(f"No files found matching '{query}'.")
                 self.logger.info(f"No files found for query '{query}' in chat {chat_id}")
         except Exception as e:
