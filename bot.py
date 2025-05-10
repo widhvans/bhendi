@@ -47,7 +47,7 @@ class TelegramBot:
         if is_private and user_id in self.indexing_requests:
             link_match = None
             if message.text:
-                link_match = re.match(r'https://t\.me/c/([-0-9]+)/(\d+)', message.text)
+                link_match = re.match(r'https://t\.me/c/(\d+)/(\d+)', message.text)
             forward_chat = message.forward_from_chat if (message.forward_from_chat and message.forward_from_chat.type in ['group', 'supergroup', 'channel']) else None
 
             if link_match:
@@ -65,12 +65,10 @@ class TelegramBot:
                         del self.indexing_requests[user_id]
                     else:
                         self.logger.warning(f"Bot is not admin in chat {chat_id_from_link}")
-                        await update.message.reply_text("I'm not an admin in that chat.")
-                        del self.indexing_requests[user_id]
+                        await update.message.reply_text("I'm not an admin in that chat. Send another link or cancel with /cancel.")
                 except telegram.error.Forbidden as e:
                     self.logger.error(f"Cannot access chat {chat_id_from_link}: {str(e)}")
-                    await update.message.reply_text("I cannot access that chat.")
-                    del self.indexing_requests[user_id]
+                    await update.message.reply_text("I cannot access that chat. Send another link or cancel with /cancel.")
             elif forward_chat:
                 try:
                     bot_member = await context.bot.get_chat_member(forward_chat.id, context.bot.id)
@@ -92,29 +90,12 @@ class TelegramBot:
                         del self.indexing_requests[user_id]
                     else:
                         self.logger.warning(f"Bot is not admin in forwarded chat {forward_chat.id}")
-                        await update.message.reply_text("I'm not an admin in that chat.")
-                        del self.indexing_requests[user_id]
+                        await update.message.reply_text("I'm not an admin in that chat. Send another link or cancel with /cancel.")
                 except telegram.error.Forbidden as e:
                     self.logger.error(f"Cannot access forwarded chat {forward_chat.id}: {str(e)}")
-                    await update.message.reply_text("I cannot access that chat.")
-                    del self.indexing_requests[user_id]
+                    await update.message.reply_text("I cannot access that chat. Send another link or cancel with /cancel.")
             else:
                 await update.message.reply_text("Please send a valid Telegram file link (e.g., https://t.me/c/1814841940/588956) or forward a file message.")
-            return
-
-        # Handle forwarded messages in private chats
-        if is_private and (message.forward_from_chat or message.forward_from):
-            forward_chat = message.forward_from_chat
-            if forward_chat and forward_chat.type in ['group', 'supergroup', 'channel']:
-                try:
-                    bot_member = await context.bot.get_chat_member(forward_chat.id, context.bot.id)
-                    if bot_member.status == 'administrator':
-                        if message.document or message.video or message.audio or message.photo:
-                            await self.index_file(message, context, forward_chat.id, is_forwarded=True, user_id=user_id)
-                    else:
-                        self.logger.warning(f"Bot is not admin in forwarded chat {forward_chat.id}")
-                except telegram.error.Forbidden as e:
-                    self.logger.error(f"Cannot access forwarded chat {forward_chat.id}: {str(e)}")
             return
 
         # Handle direct messages in groups/channels
@@ -136,6 +117,17 @@ class TelegramBot:
 
         if message.text:
             await self.handle_search(message, context)
+
+    async def cancel_command(self, update, context):
+        user_id = update.message.from_user.id
+        if user_id in self.indexing_requests:
+            chat_id = self.indexing_requests[user_id]['chat_id']
+            self.logger.info(f"User {user_id} cancelled indexing for chat {chat_id or 'unknown'}")
+            await update.message.reply_text(f"Indexing cancelled for chat {chat_id or 'unknown'}.")
+            del self.indexing_requests[user_id]
+        else:
+            self.logger.debug(f"/cancel command from user {user_id} with no active indexing")
+            await update.message.reply_text("No active indexing session.")
 
     def get_file_id(self, message):
         if message.document:
@@ -239,7 +231,7 @@ class TelegramBot:
 
             if not data.get('ok') or 'result' not in data:
                 self.logger.warning(f"No message found for ID {message_id} in chat {chat_id}: {data.get('description', 'Unknown error')}")
-                await context.bot.send_message(user_id, f"No message found for ID {message_id} in chat {chat_id}.")
+                await context.bot.send_message(user_id, f"No message found for ID {message_id} in chat {chat_id}. Try a different link.")
                 return
 
             message_data = data['result']
@@ -253,15 +245,16 @@ class TelegramBot:
                     processed_ids.add(file_id)
                 else:
                     self.logger.debug(f"Skipped duplicate or non-media file {file_id or 'None'} in chat {chat_id}")
+                    await context.bot.send_message(user_id, f"Message {message_id} in chat {chat_id} is a duplicate or does not contain a file.")
             else:
                 self.logger.debug(f"Skipped non-media message {message_id} in chat {chat_id}")
-                await context.bot.send_message(user_id, f"Message {message_id} in chat {chat_id} does not contain a file.")
+                await context.bot.send_message(user_id, f"Message {message_id} in chat {chat_id} does not contain a file. Try a different link.")
         except requests.exceptions.RequestException as e:
             self.logger.warning(f"Error fetching message {message_id} in chat {chat_id}: {str(e)}")
-            await context.bot.send_message(user_id, f"Error fetching message {message_id} in chat {chat_id}: {str(e)}")
+            await context.bot.send_message(user_id, f"Error fetching message {message_id} in chat {chat_id}: {str(e)}. Try a different link.")
         except Exception as e:
             self.logger.error(f"Error indexing file from link for message {message_id} in chat {chat_id}: {str(e)}")
-            await context.bot.send_message(user_id, f"Error indexing file from link for message {message_id} in chat {chat_id}: {str(e)}")
+            await context.bot.send_message(user_id, f"Error indexing file from link for message {message_id} in chat {chat_id}: {str(e)}. Try a different link.")
 
     async def index_previous_files(self, context, chat_id, user_id, start_message_id):
         try:
@@ -269,7 +262,7 @@ class TelegramBot:
             messages_processed = 0
             max_messages = 100  # Limit to avoid rate limits
             consecutive_failures = 0
-            max_consecutive_failures = 10  # Stop after 10 consecutive 404s
+            max_consecutive_failures = 50  # Increased to allow more attempts
             processed_ids = self.indexing_requests[user_id]['processed_ids']
             api_url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/getMessage"
 
@@ -302,7 +295,7 @@ class TelegramBot:
 
                     message_id -= 1
                     messages_processed += 1
-                    await asyncio.sleep(0.3)  # Increased delay to avoid rate limits
+                    await asyncio.sleep(0.3)  # Delay to avoid rate limits
                 except requests.exceptions.RequestException as e:
                     self.logger.warning(f"Error fetching message {message_id} in chat {chat_id}: {str(e)}")
                     consecutive_failures += 1
@@ -375,6 +368,7 @@ class TelegramBot:
         try:
             self.app.add_handler(CommandHandler("start", self.start))
             self.app.add_handler(CommandHandler("index", self.index_command))
+            self.app.add_handler(CommandHandler("cancel", self.cancel_command))
             self.app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_message))
             self.app.add_error_handler(self.error_handler)
             self.app.run_polling()
