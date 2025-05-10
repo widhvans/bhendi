@@ -17,12 +17,12 @@ class TelegramBot:
 
     async def start(self, update, context):
         self.logger.info(f"Start command received from user {update.message.from_user.id}")
-        await update.message.reply_text("Bot started! I index files in group chats and allow file searches.")
+        await update.message.reply_text("Bot started! Send file names to search in group/channel chats.")
 
     async def handle_message(self, update, context):
         message = update.message or update.channel_post
         if not message:
-            self.logger.debug("No message or channel post found in update")
+            self.logger.debug("Invalid update: no message or channel post")
             return
 
         chat_id = message.chat_id
@@ -39,14 +39,11 @@ class TelegramBot:
             self.logger.error(f"Cannot access chat {chat_id}: {str(e)}")
             return
 
-        if message.document or message.video or message.audio or message.photo or \
-           (message.forward_from or message.forward_from_chat) and \
-           (message.forward_from_message_id or message.forward_from_chat):
+        if message.document or message.video or message.audio or message.photo:
             await self.index_file(message, context)
 
         if message.text:
-            if await self.is_search_request(message.text):
-                await self.handle_search(message, context)
+            await self.handle_search(message, context)
 
     async def index_file(self, message, context):
         chat_id = message.chat_id
@@ -108,17 +105,12 @@ class TelegramBot:
         except Exception as e:
             self.logger.error(f"Error indexing file in chat {chat_id}: {str(e)}")
 
-    async def is_search_request(self, text):
-        return bool(re.match(r'^[!/]search\s+(.+)$', text, re.IGNORECASE))
-
     async def handle_search(self, message, context):
         chat_id = message.chat_id
-        text = message.text
-        match = re.match(r'^[!/]search\s+(.+)$', text, re.IGNORECASE)
-        if not match:
+        query = message.text.strip()
+        if not query:
             return
 
-        query = match.group(1).strip()
         self.logger.info(f"Search request for '{query}' in chat {chat_id}")
 
         try:
