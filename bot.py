@@ -20,9 +20,14 @@ class TelegramBot:
         await update.message.reply_text("Bot started! I index files in group chats and allow file searches.")
 
     async def handle_message(self, update, context):
-        chat_id = update.message.chat_id
-        if not update.message.chat.type in ['group', 'supergroup', 'channel']:
-            self.logger.debug(f"Ignoring message from non-group chat {chat_id}")
+        message = update.message or update.channel_post
+        if not message:
+            self.logger.debug("No message or channel post found in update")
+            return
+
+        chat_id = message.chat_id
+        if message.chat.type not in ['group', 'supergroup', 'channel']:
+            self.logger.debug(f"Ignoring message from non-group/channel chat {chat_id}")
             return
 
         try:
@@ -34,16 +39,17 @@ class TelegramBot:
             self.logger.error(f"Cannot access chat {chat_id}: {str(e)}")
             return
 
-        if update.message.document or update.message.video or update.message.audio or update.message.photo:
-            await self.index_file(update, context)
+        if message.document or message.video or message.audio or message.photo or \
+           (message.forward_from or message.forward_from_chat) and \
+           (message.forward_from_message_id or message.forward_from_chat):
+            await self.index_file(message, context)
 
-        if update.message.text:
-            if await self.is_search_request(update.message.text):
-                await self.handle_search(update, context)
+        if message.text:
+            if await self.is_search_request(message.text):
+                await self.handle_search(message, context)
 
-    async def index_file(self, update, context):
-        chat_id = update.message.chat_id
-        message = update.message
+    async def index_file(self, message, context):
+        chat_id = message.chat_id
         file_info = {}
 
         try:
@@ -55,7 +61,8 @@ class TelegramBot:
                     'size': message.document.file_size,
                     'chat_id': chat_id,
                     'message_id': message.message_id,
-                    'timestamp': message.date
+                    'timestamp': message.date,
+                    'forwarded': bool(message.forward_from or message.forward_from_chat)
                 }
             elif message.video:
                 file_info = {
@@ -65,7 +72,8 @@ class TelegramBot:
                     'size': message.video.file_size,
                     'chat_id': chat_id,
                     'message_id': message.message_id,
-                    'timestamp': message.date
+                    'timestamp': message.date,
+                    'forwarded': bool(message.forward_from or message.forward_from_chat)
                 }
             elif message.audio:
                 file_info = {
@@ -75,7 +83,8 @@ class TelegramBot:
                     'size': message.audio.file_size,
                     'chat_id': chat_id,
                     'message_id': message.message_id,
-                    'timestamp': message.date
+                    'timestamp': message.date,
+                    'forwarded': bool(message.forward_from or message.forward_from_chat)
                 }
             elif message.photo:
                 file_info = {
@@ -85,13 +94,14 @@ class TelegramBot:
                     'size': message.photo[-1].file_size,
                     'chat_id': chat_id,
                     'message_id': message.message_id,
-                    'timestamp': message.date
+                    'timestamp': message.date,
+                    'forwarded': bool(message.forward_from or message.forward_from_chat)
                 }
 
             if file_info:
                 if not self.db.file_exists(file_info['file_id']):
                     self.db.save_file(file_info)
-                    self.logger.info(f"Indexed file {file_info['name']} (ID: {file_info['file_id']}) in chat {chat_id}")
+                    self.logger.info(f"Indexed file {file_info['name']} (ID: {file_info['file_id']}) in chat {chat_id}{' (forwarded)' if file_info['forwarded'] else ''}")
                     await self.update_indexing_status(context, chat_id)
                 else:
                     self.logger.debug(f"Skipped duplicate file {file_info['name']} (ID: {file_info['file_id']}) in chat {chat_id}")
@@ -101,9 +111,9 @@ class TelegramBot:
     async def is_search_request(self, text):
         return bool(re.match(r'^[!/]search\s+(.+)$', text, re.IGNORECASE))
 
-    async def handle_search(self, update, context):
-        chat_id = update.message.chat_id
-        text = update.message.text
+    async def handle_search(self, message, context):
+        chat_id = message.chat_id
+        text = message.text
         match = re.match(r'^[!/]search\s+(.+)$', text, re.IGNORECASE)
         if not match:
             return
@@ -133,7 +143,7 @@ class TelegramBot:
                         f"File '{query}' not found in chat {chat_id}"
                     )
                     self.logger.info(f"Notified admin {admin.user.id} about missing file '{query}'")
-                await update.message.reply_text(f"No files found matching '{query}'.")
+                await message.reply_text(f"No files found matching '{query}'.")
                 self.logger.info(f"No files found for query '{query}' in chat {chat_id}")
         except Exception as e:
             self.logger.error(f"Error handling search for '{query}' in chat {chat_id}: {str(e)}")
