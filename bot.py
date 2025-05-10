@@ -47,7 +47,7 @@ class TelegramBot:
         if is_private and user_id in self.indexing_requests:
             link_match = None
             if message.text:
-                link_match = re.match(r'https://t\.me/c/(\d+)/(\d+)', message.text)
+                link_match = re.match(r'https://t\.me/c/([-0-9]+)/(\d+)', message.text)
             forward_chat = message.forward_from_chat if (message.forward_from_chat and message.forward_from_chat.type in ['group', 'supergroup', 'channel']) else None
 
             if link_match:
@@ -58,6 +58,7 @@ class TelegramBot:
                     if bot_member.status == 'administrator':
                         self.indexing_requests[user_id]['chat_id'] = chat_id_from_link
                         self.logger.info(f"User {user_id} provided link for chat {chat_id_from_link}, message {message_id}")
+                        await context.bot.send_message(user_id, f"Starting indexing for chat {chat_id_from_link}, message {message_id}...")
                         await self.index_file_from_link(context, chat_id_from_link, user_id, message_id)
                         await self.index_previous_files(context, chat_id_from_link, user_id, message_id - 1)
                         await context.bot.send_message(user_id, f"Finished indexing files for chat {chat_id_from_link}.")
@@ -82,6 +83,7 @@ class TelegramBot:
                                 await self.index_file(message, context, forward_chat.id, is_forwarded=True, user_id=user_id)
                                 self.indexing_requests[user_id]['processed_ids'].add(file_id)
                             message_id = message.forward_from_message_id if message.forward_from_message_id else message.message_id
+                            await context.bot.send_message(user_id, f"Starting indexing for chat {forward_chat.id}, message {message_id}...")
                             await self.index_previous_files(context, forward_chat.id, user_id, message_id - 1)
                         else:
                             await update.message.reply_text("Please forward a message containing a file (document, video, audio, or photo).")
@@ -225,6 +227,8 @@ class TelegramBot:
                     await self.update_indexing_status(context, target_chat_id, user_id)
         except Exception as e:
             self.logger.error(f"Error indexing file in chat {target_chat_id}: {str(e)}")
+            if user_id:
+                await context.bot.send_message(user_id, f"Error indexing file in chat {target_chat_id}: {str(e)}")
 
     async def index_file_from_link(self, context, chat_id, user_id, message_id):
         try:
@@ -235,6 +239,7 @@ class TelegramBot:
 
             if not data.get('ok') or 'result' not in data:
                 self.logger.warning(f"No message found for ID {message_id} in chat {chat_id}: {data.get('description', 'Unknown error')}")
+                await context.bot.send_message(user_id, f"No message found for ID {message_id} in chat {chat_id}.")
                 return
 
             message_data = data['result']
@@ -250,20 +255,25 @@ class TelegramBot:
                     self.logger.debug(f"Skipped duplicate or non-media file {file_id or 'None'} in chat {chat_id}")
             else:
                 self.logger.debug(f"Skipped non-media message {message_id} in chat {chat_id}")
+                await context.bot.send_message(user_id, f"Message {message_id} in chat {chat_id} does not contain a file.")
         except requests.exceptions.RequestException as e:
             self.logger.warning(f"Error fetching message {message_id} in chat {chat_id}: {str(e)}")
+            await context.bot.send_message(user_id, f"Error fetching message {message_id} in chat {chat_id}: {str(e)}")
         except Exception as e:
             self.logger.error(f"Error indexing file from link for message {message_id} in chat {chat_id}: {str(e)}")
+            await context.bot.send_message(user_id, f"Error indexing file from link for message {message_id} in chat {chat_id}: {str(e)}")
 
     async def index_previous_files(self, context, chat_id, user_id, start_message_id):
         try:
             message_id = start_message_id
             messages_processed = 0
             max_messages = 100  # Limit to avoid rate limits
+            consecutive_failures = 0
+            max_consecutive_failures = 10  # Stop after 10 consecutive 404s
             processed_ids = self.indexing_requests[user_id]['processed_ids']
             api_url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/getMessage"
 
-            while messages_processed < max_messages and message_id > 0:
+            while messages_processed < max_messages and message_id > 0 and consecutive_failures < max_consecutive_failures:
                 try:
                     response = requests.get(api_url, params={'chat_id': chat_id, 'message_id': message_id})
                     response.raise_for_status()
@@ -271,10 +281,12 @@ class TelegramBot:
 
                     if not data.get('ok') or 'result' not in data:
                         self.logger.debug(f"No message found for ID {message_id} in chat {chat_id}: {data.get('description', 'Unknown error')}")
+                        consecutive_failures += 1
                         message_id -= 1
                         messages_processed += 1
                         continue
 
+                    consecutive_failures = 0  # Reset on success
                     message_data = data['result']
                     message = telegram.Message.de_json(message_data, context.bot)
 
@@ -290,9 +302,10 @@ class TelegramBot:
 
                     message_id -= 1
                     messages_processed += 1
-                    await asyncio.sleep(0.2)  # Delay to avoid rate limits
+                    await asyncio.sleep(0.3)  # Increased delay to avoid rate limits
                 except requests.exceptions.RequestException as e:
                     self.logger.warning(f"Error fetching message {message_id} in chat {chat_id}: {str(e)}")
+                    consecutive_failures += 1
                     message_id -= 1
                     messages_processed += 1
                     await asyncio.sleep(0.5)  # Extra delay on error
@@ -300,7 +313,7 @@ class TelegramBot:
                     self.logger.error(f"Error processing message {message_id} in chat {chat_id}: {str(e)}")
                     break
 
-            self.logger.info(f"Completed indexing {messages_processed} messages for chat {chat_id}")
+            self.logger.info(f"Completed indexing {messages_processed} messages for chat {chat_id} with {consecutive_failures} consecutive failures")
             await context.bot.send_message(user_id, f"Finished indexing files for chat {chat_id}. Processed {messages_processed} messages.")
         except Exception as e:
             self.logger.error(f"Error indexing previous files for chat {chat_id}: {str(e)}")
