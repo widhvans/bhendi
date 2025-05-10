@@ -28,7 +28,18 @@ class TelegramBot:
             return
         self.indexing_requests[user_id] = None
         self.logger.info(f"/index command received from user {user_id}")
-        await update.message.reply_text("Please forward the last message from the group/channel where I'm an admin to start indexing all files.")
+        await update.message.reply_text("Please forward all file messages (documents, videos, audios, photos) from the group/channel where I'm an admin. Send /done when finished.")
+
+    async def done_command(self, update, context):
+        user_id = update.message.from_user.id
+        if user_id in self.indexing_requests:
+            chat_id = self.indexing_requests[user_id]
+            del self.indexing_requests[user_id]
+            self.logger.info(f"User {user_id} finished indexing for chat {chat_id}")
+            await update.message.reply_text(f"Finished indexing files for chat {chat_id or 'unknown'}.")
+        else:
+            self.logger.debug(f"/done command from user {user_id} with no active indexing")
+            await update.message.reply_text("No active indexing session.")
 
     async def handle_message(self, update, context):
         message = update.message or update.channel_post
@@ -41,25 +52,27 @@ class TelegramBot:
         is_private = message.chat.type == 'private'
         is_group_or_channel = message.chat.type in ['group', 'supergroup', 'channel']
 
-        # Handle /index forwarded message in private chat
+        # Handle /index forwarded messages in private chat
         if is_private and user_id in self.indexing_requests and (message.forward_from_chat or message.forward_from):
             forward_chat = message.forward_from_chat
             if forward_chat and forward_chat.type in ['group', 'supergroup', 'channel']:
                 try:
                     bot_member = await context.bot.get_chat_member(forward_chat.id, context.bot.id)
                     if bot_member.status == 'administrator':
-                        self.indexing_requests[user_id] = forward_chat.id
-                        self.logger.info(f"User {user_id} forwarded message from chat {forward_chat.id} for indexing")
-                        await update.message.reply_text(f"Starting to index all files from chat {forward_chat.id}...")
-                        await self.index_all_files(context, forward_chat.id, user_id, message.message_id)
-                        del self.indexing_requests[user_id]
+                        if self.indexing_requests[user_id] is None:
+                            self.indexing_requests[user_id] = forward_chat.id
+                            self.logger.info(f"User {user_id} started indexing for chat {forward_chat.id}")
+                        if message.document or message.video or message.audio or message.photo:
+                            await self.index_file(message, context, forward_chat.id, is_forwarded=True, user_id=user_id)
+                        else:
+                            await update.message.reply_text("Please forward a message containing a file (document, video, audio, or photo).")
                     else:
                         self.logger.warning(f"Bot is not admin in forwarded chat {forward_chat.id}")
-                        await update.message.reply_text("I'm not an admin in that chat.")
+                        await update.message.reply_text("I'm not an admin in that chat. Send /done to stop.")
                         del self.indexing_requests[user_id]
                 except telegram.error.Forbidden as e:
                     self.logger.error(f"Cannot access forwarded chat {forward_chat.id}: {str(e)}")
-                    await update.message.reply_text("I cannot access that chat.")
+                    await update.message.reply_text("I cannot access that chat. Send /done to stop.")
                     del self.indexing_requests[user_id]
             return
 
@@ -167,35 +180,6 @@ class TelegramBot:
         except Exception as e:
             self.logger.error(f"Error indexing file in chat {target_chat_id}: {str(e)}")
 
-    async def index_all_files(self, context, chat_id, user_id, last_message_id):
-        try:
-            message_id = last_message_id
-            messages_processed = 0
-            max_messages = 100  # Limit to avoid rate limits
-
-            while messages_processed < max_messages:
-                try:
-                    message = await context.bot.get_message(chat_id, message_id)
-                    if message.document or message.video or message.audio or message.photo:
-                        await self.index_file(message, context, chat_id, is_forwarded=True, user_id=user_id)
-                    message_id -= 1
-                    messages_processed += 1
-                except telegram.error.BadRequest as e:
-                    if "Message_id_invalid" in str(e):
-                        break  # No more messages
-                    self.logger.warning(f"Error fetching message {message_id} in chat {chat_id}: {str(e)}")
-                    message_id -= 1
-                    messages_processed += 1
-                except Exception as e:
-                    self.logger.error(f"Error processing message {message_id} in chat {chat_id}: {str(e)}")
-                    break
-
-            self.logger.info(f"Completed indexing {messages_processed} messages for chat {chat_id}")
-            await context.bot.send_message(user_id, f"Finished indexing files for chat {chat_id}. Processed {messages_processed} messages.")
-        except Exception as e:
-            self.logger.error(f"Error indexing all files for chat {chat_id}: {str(e)}")
-            await context.bot.send_message(user_id, f"Error indexing files for chat {chat_id}: {str(e)}")
-
     async def handle_search(self, message, context):
         chat_id = message.chat_id
         query = message.text.strip()
@@ -252,6 +236,7 @@ class TelegramBot:
         try:
             self.app.add_handler(CommandHandler("start", self.start))
             self.app.add_handler(CommandHandler("index", self.index_command))
+            self.app.add_handler(CommandHandler("done", self.done_command))
             self.app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, self.handle_message))
             self.app.add_error_handler(self.error_handler)
             self.app.run_polling()
