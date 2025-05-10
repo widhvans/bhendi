@@ -1,84 +1,29 @@
 from pymongo import MongoClient
 import config
-import logging
-
-# Configure logging for database.py
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),  # Console output
-        logging.FileHandler('bot.log')  # File output
-    ]
-)
-logging.getLogger('httpx').setLevel(logging.WARNING)
-logging.getLogger('telegram').setLevel(logging.WARNING)
-logger = logging.getLogger(__name__)
 
 class Database:
     def __init__(self):
         self.client = MongoClient(config.MONGO_URI)
-        self.db = self.client['telegram_bot']
-        self.files = self.db['files']
-        self.index_state = self.db['index_state']
-        
-        # Create index for faster searches
-        self.files.create_index([('chat_id', 1), ('file_name', 'text')])
-        self.index_state.create_index([('chat_id', 1)])
-    
-    def save_file(self, chat_id, file_name, file_id):
-        self.files.update_one(
-            {
-                'chat_id': chat_id,
-                'file_name': file_name,
-                'file_id': file_id
-            },
-            {
-                '$set': {
-                    'chat_id': chat_id,
-                    'file_name': file_name,
-                    'file_id': file_id
-                }
-            },
-            upsert=True
-        )
-    
-    def search_files(self, chat_id, search_term):
-        return list(self.files.find({
-            'chat_id': chat_id,
-            '$text': {'$search': search_term}
-        }))
-    
+        self.db = self.client[config.DATABASE_NAME]
+        self.files = self.db.files
+        self.files.create_index([("file_id", 1)], unique=True)
+        self.files.create_index([("name", "text")])
+
+    def save_file(self, file_info):
+        try:
+            self.files.insert_one(file_info)
+            return True
+        except:
+            return False
+
+    def file_exists(self, file_id):
+        return self.files.find_one({"file_id": file_id}) is not None
+
+    def search_files(self, query):
+        return list(self.files.find({"$text": {"$search": query}}))
+
     def get_file_count(self, chat_id):
-        return self.files.count_documents({'chat_id': chat_id})
-    
-    def save_indexed_offset(self, chat_id, offset):
-        logger.info(f"Saving last indexed offset {offset} for chat {chat_id}")
-        self.index_state.update_one(
-            {'chat_id': chat_id},
-            {'$set': {'last_offset': offset}},
-            upsert=True
-        )
-    
-    def get_last_indexed_offset(self, chat_id):
-        state = self.index_state.find_one({'chat_id': chat_id})
-        offset = state.get('last_offset', 0) if state else 0
-        logger.info(f"Retrieved last indexed offset {offset} for chat {chat_id}")
-        return offset
-    
-    def save_indexed_message_id(self, chat_id, message_id):
-        logger.info(f"Saving last indexed message_id {message_id} for chat {chat_id}")
-        self.index_state.update_one(
-            {'chat_id': chat_id},
-            {'$set': {'last_message_id': message_id}},
-            upsert=True
-        )
-    
-    def get_last_indexed_message_id(self, chat_id):
-        state = self.index_state.find_one({'chat_id': chat_id})
-        message_id = state.get('last_message_id', 0) if state else 0
-        logger.info(f"Retrieved last indexed message_id {message_id} for chat {chat_id}")
-        return message_id
-    
+        return self.files.count_documents({"chat_id": chat_id})
+
     def close(self):
         self.client.close()
